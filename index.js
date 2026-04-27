@@ -15,7 +15,7 @@ app.use(session({
 
 const mongoURI = process.env.MONGO_URI;
 const ADMIN_KEY = process.env.ADMIN_KEY || "meric123";
-const AUTHORIZED_USERS = ["Meric", "WoodsKitty98637", "Fatal Log"];
+const AUTHORIZED_USERS = ["OxygenForge", "Batu", "GORKEMHAHANEYMAR"];
 
 // 2. VERİTABANI MODELLERİ
 let isConnected = false;
