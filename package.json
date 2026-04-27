@@ -1,12 +1,17 @@
 {
-  "name": "roblox-sync",
+  "name": "roblox-sync-backend",
   "version": "1.0.0",
+  "description": "OxygenForge Roblox Veri Senkronizasyon Sistemi",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "mongoose": "^8.0.0"
+    "mongoose": "^7.0.0",
+    "express-session": "^1.17.3"
+  },
+  "engines": {
+    "node": ">=14.0.0"
   }
 }
