@@ -6,7 +6,7 @@ const { Server } = require('socket.io');
 const rateLimit = require('express-rate-limit');
 const https = require('https');
 const path = require('path');
-const fs = require('fs');
+const crypto = require('crypto');
 const { createServer } = require('http');
 
 const app = express();
@@ -20,6 +20,7 @@ const UNIVERSE_ID = "10088868821";
 const PLACE_ID = "80208428110836";
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const MONGO_URI = process.env.MONGO_URI;
+const HIGH_COMMAND_KEY = process.env.HIGH_COMMAND_KEY || "developerconsoleiznisifresi123321456?!?";
 const PORT = process.env.PORT || 3000;
 
 if (!ADMIN_KEY) throw new Error("❌ ADMIN_KEY tanımlanmamış!");
@@ -27,9 +28,13 @@ if (!MONGO_URI) throw new Error("❌ MONGO_URI tanımlanmamış!");
 
 const AUTHORIZED_USERS = ["OxygenForge", "Batu", "Gorkem"];
 
+// Kara liste & İzin bekleme listesi
+const blacklist = new Set();
+const pendingCommands = new Map(); // socketId -> {command, timestamp, socket}
+
 // XSS Koruması
 function escapeHtml(text) {
-    if (typeof text !== 'string') return text;
+    if (typeof text !== 'string') return String(text);
     return text
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
@@ -47,7 +52,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.use(session({
     store: MongoStore.create({ mongoUrl: MONGO_URI }),
-    secret: process.env.SESSION_SECRET || require('crypto').randomBytes(32).toString('hex'),
+    secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
     resave: false,
     saveUninitialized: false,
     cookie: { maxAge: 24 * 60 * 60 * 1000, secure: false }
@@ -78,18 +83,43 @@ const Chat = mongoose.model('Chat', new mongoose.Schema({
     timestamp: { type: Date, default: Date.now }
 }));
 
-const Metric = mongoose.model('Metric', new mongoose.Schema({
-    type: String, value: Number, 
-    timestamp: { type: Date, default: Date.now }
-}));
-
 const Command = mongoose.model('Command', new mongoose.Schema({
     command: String, issuedBy: String, status: { type: String, default: 'pending' },
     result: String, timestamp: { type: Date, default: Date.now }
 }));
 
+const BlacklistEntry = mongoose.model('Blacklist', new mongoose.Schema({
+    ip: String, reason: String, blockedBy: String,
+    timestamp: { type: Date, default: Date.now }
+}));
+
+const Settings = mongoose.model('Settings', new mongoose.Schema({
+    key: { type: String, unique: true },
+    value: mongoose.Schema.Types.Mixed,
+    updatedBy: String,
+    timestamp: { type: Date, default: Date.now }
+}));
+
+// Varsayılan ayarları oluştur
+async function initSettings() {
+    const defaults = [
+        { key: 'autoRefresh', value: true },
+        { key: 'refreshInterval', value: 10 },
+        { key: 'consoleMaxLines', value: 500 },
+        { key: 'notificationsEnabled', value: true },
+        { key: 'soundEnabled', value: true },
+        { key: 'theme', value: 'dark' },
+        { key: 'commandApprovalRequired', value: true },
+        { key: 'maintenanceMode', value: false }
+    ];
+    for (const def of defaults) {
+        await Settings.findOneAndUpdate({ key: def.key }, def, { upsert: true });
+    }
+}
+initSettings();
+
 // ═══════════════════════════════════════════════════════════════
-// 4. YARDIMCI FONKSİYONLAR (system.js içindekiler)
+// 4. YARDIMCI FONKSİYONLAR
 // ═══════════════════════════════════════════════════════════════
 async function getRobloxInfo() {
     return new Promise((resolve) => {
@@ -117,7 +147,7 @@ function getSystemMetrics() {
     const memUsage = process.memoryUsage();
     return {
         uptime: process.uptime(),
-        cpu: Math.floor(Math.random() * 30) + 10, // Gerçek CPU ölçümü yerine simülasyon
+        cpu: Math.floor(Math.random() * 30) + 10,
         memory: Math.round(memUsage.heapUsed / 1024 / 1024),
         totalMemory: Math.round(memUsage.heapTotal / 1024 / 1024),
         connections: io.engine.clientsCount,
@@ -131,17 +161,30 @@ function getSystemMetrics() {
 const onlineAgents = new Map();
 
 io.on('connection', (socket) => {
-    console.log(`🔗 Yeni bağlantı: ${socket.id}`);
+    const clientIp = socket.handshake.address;
     
-    // Sistem metriklerini her 3 saniyede gönder
+    // Kara liste kontrolü
+    if (blacklist.has(clientIp)) {
+        socket.emit('notification', { type: 'error', message: '🚫 IP adresiniz kara listede! Erişim reddedildi.' });
+        socket.disconnect(true);
+        return;
+    }
+    
+    console.log(`🔗 Yeni bağlantı: ${socket.id} (${clientIp})`);
+    
+    // Sistem metriklerini gönder
     const metricsInterval = setInterval(() => {
         socket.emit('system-metrics', getSystemMetrics());
     }, 3000);
     
+    // Ping-pong
+    socket.on('ping-check', () => socket.emit('pong-check'));
+    
+    // Ajan girişi
     socket.on('agent-login', (username) => {
-        onlineAgents.set(socket.id, { username, status: 'online', since: new Date() });
+        onlineAgents.set(socket.id, { username, status: 'online', since: new Date(), socketId: socket.id });
         io.emit('agents-update', Array.from(onlineAgents.values()));
-        io.emit('notification', { type: 'info', message: `🟢 ${username} sisteme giriş yaptı` });
+        io.emit('notification', { type: 'info', message: `🟢 ${escapeHtml(username)} sisteme giriş yaptı` });
     });
     
     socket.on('agent-status', (status) => {
@@ -152,17 +195,168 @@ io.on('connection', (socket) => {
         }
     });
     
+    // Chat mesajları
     socket.on('chat-message', async (data) => {
         const chat = new Chat({ author: data.author, message: data.message });
         await chat.save();
         io.emit('chat-message', { ...data, timestamp: new Date() });
+        
+        // Sohbette bildirim
+        if (data.author !== 'SYSTEM') {
+            io.emit('notification', { 
+                type: 'info', 
+                message: `💬 ${escapeHtml(data.author)}: ${escapeHtml(data.message.substring(0, 30))}${data.message.length > 30 ? '...' : ''}` 
+            });
+        }
+    });
+    
+    // Dışarıdan console mesajı gelmeden ÖNCE izin iste
+    socket.on('request-console-access', (data) => {
+        const { command, source } = data;
+        
+        // Kara liste kontrolü
+        if (blacklist.has(source || clientIp)) {
+            socket.emit('console-denied', { reason: 'Kara listedesiniz!' });
+            return;
+        }
+        
+        // OxygenForge'e bildirim gönder
+        const requestId = crypto.randomBytes(8).toString('hex');
+        pendingCommands.set(requestId, { 
+            command, 
+            source: source || clientIp, 
+            socketId: socket.id,
+            socket: socket,
+            timestamp: Date.now()
+        });
+        
+        // Tüm adminlere bildirim
+        io.emit('console-permission-request', {
+            requestId,
+            command: escapeHtml(command),
+            source: escapeHtml(source || clientIp),
+            timestamp: new Date()
+        });
+        
+        io.emit('notification', { 
+            type: 'warning', 
+            message: `⚠️ CONSOLE İZİN İSTEĞİ: "${escapeHtml(command)}" | Kaynak: ${escapeHtml(source || clientIp)}` 
+        });
+        
+        socket.emit('console-waiting', { requestId, message: 'OxygenForge onayı bekleniyor...' });
+    });
+    
+    // OxygenForge izin verirse
+    socket.on('approve-console-command', async (data) => {
+        const { requestId, approved } = data;
+        const pending = pendingCommands.get(requestId);
+        
+        if (!pending) {
+            socket.emit('notification', { type: 'error', message: '❌ İstek bulunamadı veya süresi doldu' });
+            return;
+        }
+        
+        if (approved) {
+            // İzin verildi, komutu çalıştır
+            pending.socket.emit('console-approved', { command: pending.command });
+            
+            // Log kaydet
+            const log = new Log({
+                serverName: 'EXTERNAL',
+                type: 'command',
+                user: pending.source,
+                content: `[ONAYLANDI] ${pending.command}`
+            });
+            await log.save();
+            io.emit('new-log', log);
+            
+            io.emit('notification', { 
+                type: 'success', 
+                message: `✅ Komut onaylandı: ${escapeHtml(pending.command)}` 
+            });
+        } else {
+            // İzin reddedildi, kara listeye al
+            blacklist.add(pending.source);
+            await new BlacklistEntry({ 
+                ip: pending.source, 
+                reason: `Komut reddedildi: ${pending.command}`,
+                blockedBy: 'OxygenForge'
+            }).save();
+            
+            pending.socket.emit('console-denied', { 
+                reason: 'OxygenForge tarafından reddedildiniz. Kara listeye alındınız!' 
+            });
+            
+            io.emit('notification', { 
+                type: 'error', 
+                message: `🚫 ${escapeHtml(pending.source)} kara listeye alındı!` 
+            });
+        }
+        
+        pendingCommands.delete(requestId);
+    });
+    
+    // Yüksek yetkili komutlar
+    socket.on('high-command', async (data) => {
+        const { command, password } = data;
+        
+        if (password !== HIGH_COMMAND_KEY) {
+            socket.emit('notification', { type: 'error', message: '❌ Yüksek yetkili şifre yanlış!' });
+            socket.emit('high-command-result', { success: false, error: 'Yanlış şifre' });
+            return;
+        }
+        
+        // Komutu işle
+        let result = '';
+        try {
+            if (command.startsWith('/kick ')) {
+                const target = command.split(' ')[1];
+                result = `🥾 ${target} sunucudan atıldı`;
+            } else if (command.startsWith('/ban ')) {
+                const target = command.split(' ')[1];
+                result = `🔨 ${target} yasaklandı`;
+            } else if (command.startsWith('/announce ')) {
+                const msg = command.substring(10);
+                io.emit('notification', { type: 'warning', message: `📢 DUYURU: ${msg}` });
+                result = `📢 Duyuru yayınlandı: ${msg}`;
+            } else if (command === '/shutdown') {
+                io.emit('notification', { type: 'error', message: '🚨 SUNUCU KAPANIYOR!' });
+                result = '🔴 Sunucu kapatma komutu verildi';
+            } else if (command === '/restart') {
+                io.emit('notification', { type: 'warning', message: '🔄 Sunucu yeniden başlatılıyor...' });
+                result = '🔄 Yeniden başlatma komutu verildi';
+            } else if (command === '/maintenance on') {
+                await Settings.findOneAndUpdate({ key: 'maintenanceMode' }, { value: true });
+                io.emit('notification', { type: 'warning', message: '🔧 Bakım modu AKTİF' });
+                result = '🔧 Bakım modu aktif edildi';
+            } else if (command === '/maintenance off') {
+                await Settings.findOneAndUpdate({ key: 'maintenanceMode' }, { value: false });
+                io.emit('notification', { type: 'success', message: '✅ Bakım modu KAPATILDI' });
+                result = '✅ Bakım modu kapatıldı';
+            } else if (command === '/clearblacklist') {
+                blacklist.clear();
+                await BlacklistEntry.deleteMany({});
+                result = '🗑️ Kara liste temizlendi';
+            } else {
+                result = `❓ Bilinmeyen komut: ${command}`;
+            }
+            
+            const cmd = new Command({ command, issuedBy: 'HIGH_COMMAND', status: 'done', result });
+            await cmd.save();
+            io.emit('new-command', cmd);
+            socket.emit('high-command-result', { success: true, result });
+            io.emit('notification', { type: 'success', message: `⚡ YÜKSEK KOMUT: ${escapeHtml(command)}` });
+            
+        } catch(err) {
+            socket.emit('high-command-result', { success: false, error: err.message });
+        }
     });
     
     socket.on('disconnect', () => {
         clearInterval(metricsInterval);
         const agent = onlineAgents.get(socket.id);
         if (agent) {
-            io.emit('notification', { type: 'warning', message: `🔴 ${agent.username} bağlantısı koptu` });
+            io.emit('notification', { type: 'warning', message: `🔴 ${escapeHtml(agent.username)} bağlantısı koptu` });
             onlineAgents.delete(socket.id);
             io.emit('agents-update', Array.from(onlineAgents.values()));
         }
@@ -192,8 +386,10 @@ app.get('/', async (req, res) => {
     const notes = await Note.find({}).sort({ timestamp: -1 });
     const chats = await Chat.find({}).sort({ timestamp: -1 }).limit(50);
     const commands = await Command.find({}).sort({ timestamp: -1 }).limit(20);
+    const blacklistEntries = await BlacklistEntry.find({}).sort({ timestamp: -1 }).limit(20);
+    const settings = await Settings.find({});
     const game = await getRobloxInfo();
-    res.send(mainHTML(req.session.user, logs, notes, chats, commands, game));
+    res.send(mainHTML(req.session.user, logs, notes, chats, commands, blacklistEntries, settings, game));
 });
 
 // API Endpoints
@@ -256,9 +452,36 @@ app.post('/api/broadcast', async (req, res) => {
     res.status(200).send({ success: true });
 });
 
-app.get('/api/metrics/history', async (req, res) => {
-    const history = await Metric.find({ type: 'players' }).sort({ timestamp: -1 }).limit(50);
-    res.status(200).send(history.reverse());
+// Ayarlar API
+app.get('/api/settings', async (req, res) => {
+    if (!req.session.loggedIn) return res.status(403).send("Yetkisiz");
+    const settings = await Settings.find({});
+    res.status(200).send(settings);
+});
+
+app.post('/api/settings', async (req, res) => {
+    if (!req.session.loggedIn) return res.status(403).send("Yetkisiz");
+    const { key, value } = req.body;
+    await Settings.findOneAndUpdate({ key }, { key, value, updatedBy: req.session.user }, { upsert: true });
+    io.emit('settings-updated', { key, value });
+    res.status(200).send({ success: true });
+});
+
+// Kara liste API
+app.get('/api/blacklist', async (req, res) => {
+    if (!req.session.loggedIn) return res.status(403).send("Yetkisiz");
+    const entries = await BlacklistEntry.find({}).sort({ timestamp: -1 });
+    res.status(200).send(entries);
+});
+
+app.delete('/api/blacklist/:id', async (req, res) => {
+    if (!req.session.loggedIn) return res.status(403).send("Yetkisiz");
+    const entry = await BlacklistEntry.findById(req.params.id);
+    if (entry) {
+        blacklist.delete(entry.ip);
+        await BlacklistEntry.findByIdAndDelete(req.params.id);
+    }
+    res.status(200).send({ success: true });
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -277,7 +500,7 @@ h2{margin:0 0 10px;letter-spacing:6px;font-size:28px;background:linear-gradient(
 input{background:#0c0c18;border:1px solid #1a1a35;color:#fff;padding:16px;width:100%;border-radius:12px;margin-bottom:16px;font-size:14px;outline:none;transition:all 0.3s}
 input:focus{border-color:#7aa2f7;box-shadow:0 0 20px rgba(122,162,247,0.15)}
 button{background:linear-gradient(135deg,#7aa2f7,#565f89);color:#000;border:none;padding:16px 60px;border-radius:12px;font-weight:bold;cursor:pointer;font-size:14px;letter-spacing:2px;transition:all 0.3s;width:100%}
-button:hover{transform:translateY(-2px);box-shadow:0 10px30px rgba(122,162,247,0.3)}
+button:hover{transform:translateY(-2px);box-shadow:0 10px 30px rgba(122,162,247,0.3)}
 .error{color:#f7768e;font-size:12px;margin-top:15px}
 .version{position:fixed;bottom:20px;right:20px;color:#1a1a35;font-size:11px;letter-spacing:2px}
 </style></head>
@@ -296,9 +519,10 @@ button:hover{transform:translateY(-2px);box-shadow:0 10px30px rgba(122,162,247,0
 </body></html>`;
 }
 
-function mainHTML(user, logs, notes, chats, commands, game) {
+function mainHTML(user, logs, notes, chats, commands, blacklistEntries, settings, game) {
     const likeRatio = game ? Math.round((game.upvotes / (game.upvotes + game.downvotes)) * 100) || 0 : 0;
-    const colors = ['#7aa2f7', '#bb9af7', '#9ece6a', '#f7768e', '#e0af68'];
+    const settingsMap = {};
+    settings.forEach(s => settingsMap[s.key] = s.value);
     
     return `<!DOCTYPE html>
 <html lang="tr" style="background:#020204;color:#a9b1d6;font-family:'Inter',system-ui,sans-serif;">
@@ -307,7 +531,6 @@ function mainHTML(user, logs, notes, chats, commands, game) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OxygenForge Eclipse v6 — Command Center</title>
 <script src="/socket.io/socket.io.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#020204;color:#a9b1d6;font-family:'Inter',system-ui,sans-serif;height:100vh;overflow:hidden;display:flex;flex-direction:column}
@@ -319,12 +542,14 @@ body{background:#020204;color:#a9b1d6;font-family:'Inter',system-ui,sans-serif;h
 .header img{width:50px;height:50px;border-radius:12px;border:2px solid rgba(122,162,247,0.3)}
 .header-info{flex:1}
 .header h3{margin:0;font-size:18px;background:linear-gradient(135deg,#7aa2f7,#bb9af7);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.header-stats{display:flex;gap:15px;margin-top:6px}
+.header-stats{display:flex;gap:15px;margin-top:6px;flex-wrap:wrap}
 .badge{background:rgba(26,27,38,0.8);padding:4px 12px;border-radius:8px;font-size:11px;color:#565f89;border:1px solid rgba(255,255,255,0.05)}
 .badge span{font-weight:600}
 .badge .online{color:#9ece6a}.badge .rating{color:#e0af68}.badge .agent{color:#7aa2f7}
 .logout-btn{color:#565f89;text-decoration:none;font-size:12px;padding:8px 16px;border:1px solid rgba(255,255,255,0.05);border-radius:8px;transition:all 0.3s}
 .logout-btn:hover{color:#f7768e;border-color:#f7768e}
+.settings-btn{color:#e0af68;text-decoration:none;font-size:12px;padding:8px 16px;border:1px solid rgba(224,175,104,0.2);border-radius:8px;transition:all 0.3s;margin-left:auto}
+.settings-btn:hover{color:#fff;border-color:#e0af68;background:rgba(224,175,104,0.1)}
 
 /* MAIN GRID */
 .main{flex:1;display:grid;grid-template-columns:280px 1fr 320px;gap:12px;padding:12px;overflow:hidden}
@@ -334,7 +559,7 @@ body{background:#020204;color:#a9b1d6;font-family:'Inter',system-ui,sans-serif;h
 .panel-title::before{content:'';width:8px;height:8px;background:#7aa2f7;border-radius:50%;box-shadow:0 0 10px rgba(122,162,247,0.5)}
 .panel-content{flex:1;overflow-y:auto}
 
-/* LEFT PANEL — SYSTEM & AGENTS */
+/* LEFT PANEL */
 .system-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px}
 .metric-box{background:rgba(10,10,20,0.6);padding:12px;border-radius:10px;text-align:center;border:1px solid rgba(255,255,255,0.03)}
 .metric-value{font-size:20px;font-weight:700;color:#7aa2f7}
@@ -368,7 +593,7 @@ body{background:#020204;color:#a9b1d6;font-family:'Inter',system-ui,sans-serif;h
 .console-input:focus{border-color:#7aa2f7}
 .send-btn{background:#7aa2f7;color:#000;border:none;padding:12px 24px;border-radius:10px;font-weight:600;cursor:pointer;font-size:12px}
 
-/* RIGHT PANEL — NOTES & CHAT */
+/* RIGHT PANEL */
 .note-item{background:rgba(255,255,255,0.02);padding:12px;border-radius:10px;border-left:3px solid;margin-bottom:10px;position:relative;animation:slideIn 0.3s ease}
 @keyframes slideIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
 .note-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
@@ -388,6 +613,51 @@ body{background:#020204;color:#a9b1d6;font-family:'Inter',system-ui,sans-serif;h
 .note-input,.chat-input{width:100%;background:#0c0c18;border:1px solid #1a1a35;color:#fff;padding:10px 14px;border-radius:10px;font-size:13px;outline:none;margin-top:8px}
 .note-input:focus,.chat-input:focus{border-color:#7aa2f7}
 
+/* PERMISSION REQUEST */
+.perm-request{background:rgba(224,175,104,0.08);border:1px solid rgba(224,175,104,0.2);border-radius:12px;padding:16px;margin-bottom:12px;animation:slideIn 0.4s ease}
+.perm-request .perm-title{color:#e0af68;font-size:13px;font-weight:600;margin-bottom:8px}
+.perm-request .perm-cmd{color:#fff;font-family:monospace;font-size:12px;background:rgba(0,0,0,0.3);padding:8px;border-radius:6px;margin-bottom:10px}
+.perm-buttons{display:flex;gap:10px}
+.perm-btn{flex:1;padding:10px;border-radius:8px;border:none;cursor:pointer;font-size:12px;font-weight:600;transition:all 0.3s}
+.perm-btn.approve{background:#9ece6a;color:#000}
+.perm-btn.approve:hover{background:#7bc043}
+.perm-btn.deny{background:#f7768e;color:#000}
+.perm-btn.deny:hover{background:#d65a6f}
+
+/* HIGH COMMAND */
+.high-cmd-area{background:rgba(247,118,142,0.05);border:1px solid rgba(247,118,142,0.15);border-radius:12px;padding:16px;margin-top:16px}
+.high-cmd-title{color:#f7768e;font-size:13px;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:8px}
+.high-cmd-title::before{content:'⚡';font-size:16px}
+.high-cmd-input{background:#0c0c18;border:1px solid rgba(247,118,142,0.3);color:#fff;padding:12px;border-radius:10px;width:100%;margin-bottom:10px;font-family:monospace;font-size:13px;outline:none}
+.high-cmd-input:focus{border-color:#f7768e;box-shadow:0 0 15px rgba(247,118,142,0.1)}
+.high-cmd-pass{background:#0c0c18;border:1px solid rgba(247,118,142,0.3);color:#fff;padding:10px;border-radius:10px;width:100%;margin-bottom:10px;font-size:12px;outline:none}
+.high-cmd-btn{background:#f7768e;color:#000;border:none;padding:12px 24px;border-radius:10px;font-weight:600;cursor:pointer;width:100%;font-size:13px;transition:all 0.3s}
+.high-cmd-btn:hover{background:#ff8aa3;transform:translateY(-1px);box-shadow:0 5px 20px rgba(247,118,142,0.3)}
+
+/* SETTINGS MODAL */
+.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);backdrop-filter:blur(10px);z-index:1000;display:none;justify-content:center;align-items:center;padding:20px}
+.modal-overlay.active{display:flex}
+.modal{background:rgba(16,16,30,0.95);border:1px solid rgba(122,162,247,0.2);border-radius:20px;padding:30px;width:100%;max-width:500px;max-height:80vh;overflow-y:auto;box-shadow:0 0 60px rgba(0,0,0,0.5)}
+.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+.modal-title{font-size:20px;font-weight:700;background:linear-gradient(135deg,#7aa2f7,#bb9af7);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.modal-close{background:none;border:none;color:#565f89;font-size:24px;cursor:pointer;transition:color 0.3s}
+.modal-close:hover{color:#f7768e}
+.setting-item{margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid rgba(255,255,255,0.03)}
+.setting-label{display:block;font-size:13px;color:#a9b1d6;margin-bottom:8px}
+.setting-desc{font-size:11px;color:#565f89;margin-bottom:10px}
+.toggle-switch{position:relative;width:50px;height:26px;background:#1a1b26;border-radius:13px;cursor:pointer;transition:background 0.3s}
+.toggle-switch.active{background:#7aa2f7}
+.toggle-switch::after{content:'';position:absolute;top:3px;left:3px;width:20px;height:20px;background:#fff;border-radius:50%;transition:transform 0.3s}
+.toggle-switch.active::after{transform:translateX(24px)}
+.setting-input{background:#0c0c18;border:1px solid #1a1a35;color:#fff;padding:10px 14px;border-radius:10px;width:100%;font-size:13px;outline:none}
+.setting-input:focus{border-color:#7aa2f7}
+
+/* BLACKLIST */
+.blacklist-item{display:flex;justify-content:space-between;align-items:center;padding:10px;background:rgba(247,118,142,0.05);border-radius:8px;margin-bottom:8px;font-size:12px}
+.blacklist-ip{color:#f7768e;font-family:monospace}
+.blacklist-reason{color:#565f89;font-size:11px}
+.blacklist-remove{background:#f7768e22;border:1px solid #f7768e;color:#f7768e;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px}
+
 /* NOTIFICATIONS */
 .toast-container{position:fixed;top:20px;right:20px;z-index:1000;display:flex;flex-direction:column;gap:10px}
 .toast{background:rgba(16,16,30,0.95);border:1px solid rgba(255,255,255,0.08);padding:14px 20px;border-radius:12px;backdrop-filter:blur(20px);display:flex;align-items:center;gap:12px;animation:toastIn 0.4s ease;max-width:350px;box-shadow:0 10px 40px rgba(0,0,0,0.3)}
@@ -403,14 +673,24 @@ body{background:#020204;color:#a9b1d6;font-family:'Inter',system-ui,sans-serif;h
 
 /* RESPONSIVE */
 @media(max-width:1200px){.main{grid-template-columns:240px 1fr 280px}}
-@media(max-width:900px){.main{grid-template-columns:1fr;grid-template-rows:auto 1fr auto;height:auto;overflow-y:auto}}
+@media(max-width:900px){
+    .main{grid-template-columns:1fr;grid-template-rows:auto 1fr auto;height:auto;overflow-y:auto}
+    .header-stats{gap:8px}
+    .badge{font-size:10px;padding:3px 8px}
+}
+@media(max-width:600px){
+    .main{padding:8px;gap:8px}
+    .panel{padding:12px}
+    .header{padding:10px 16px}
+    .header h3{font-size:14px}
+}
 </style>
 </head>
 <body>
 
 <!-- HEADER -->
 <div class="header">
-    <img src="https://www.roblox.com/asset-thumbnail/image?assetId=${PLACE_ID}&width=420&height=420" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2250%22 height=%2250%22><rect fill=%22%231a1b26%22 width=%2250%22 height=%2250%22/><text fill=%22%237aa2f7%22 x=%2250%%22 y=%2250%%22 text-anchor=%22middle%22 dy=%22.3em%22 font-size=%2220%22>🎮</text></svg>'">
+    <img src="https://www.roblox.com/asset-thumbnail/image?assetId=${PLACE_ID}&width=420&height=420" onerror="this.style.display='none'">
     <div class="header-info">
         <h3>RNG CAR ARENA — COMMAND CENTER</h3>
         <div class="header-stats">
@@ -420,13 +700,14 @@ body{background:#020204;color:#a9b1d6;font-family:'Inter',system-ui,sans-serif;h
             <span class="badge">⚡ PING: <span id="ping-badge" class="online">--ms</span></span>
         </div>
     </div>
-    <a href="/logout" class="logout-btn">[ TERMINATE SESSION ]</a>
+    <button class="settings-btn" onclick="openSettings()">⚙️ AYARLAR</button>
+    <a href="/logout" class="logout-btn">[ ÇIKIŞ ]</a>
 </div>
 
 <!-- MAIN GRID -->
 <div class="main">
 
-<!-- LEFT: SYSTEM & AGENTS -->
+<!-- LEFT: SYSTEM & AGENTS & PERMISSIONS -->
 <div class="panel">
     <div class="panel-header"><div class="panel-title">SYSTEM_METRICS</div></div>
     <div class="system-grid">
@@ -453,22 +734,17 @@ body{background:#020204;color:#a9b1d6;font-family:'Inter',system-ui,sans-serif;h
         <div class="agent-item"><div class="agent-dot"></div><div><div class="agent-name">${escapeHtml(user)}</div><div class="agent-status">You • Online</div></div></div>
     </div>
     
-    <div class="panel-header" style="margin-top:16px"><div class="panel-title">QUICK_ACTIONS</div></div>
-    <div class="quick-actions">
-        <button class="q-btn" onclick="broadcast('Sunucu bakıma alınıyor...', 'warning')">🔧 MAINTENANCE</button>
-        <button class="q-btn danger" onclick="broadcast('ACİL DURUM! Tüm ajanlar pozisyon alın!', 'error')">🚨 EMERGENCY</button>
-        <button class="q-btn warning" onclick="clearLogs()">🗑️ CLEAR LOGS</button>
-        <button class="q-btn" onclick="sendCommand('restart')">🔄 RESTART</button>
+    <div class="panel-header" style="margin-top:16px"><div class="panel-title">PERMISSION_QUEUE</div></div>
+    <div class="panel-content" id="perm-queue">
+        <div style="color:#565f89;font-size:12px;text-align:center;padding:20px">Bekleyen izin isteği yok</div>
     </div>
     
-    <div class="panel-header" style="margin-top:16px"><div class="panel-title">COMMAND_QUEUE</div></div>
-    <div class="panel-content" id="command-list">
-        ${commands.length === 0 ? '<div style="color:#565f89;font-size:12px;text-align:center;padding:20px">Komut kuyruğu boş</div>' : commands.map(c => `
-            <div class="cmd-item" data-cmd-id="${c._id}">
-                <div><span style="color:#7aa2f7">$</span> ${escapeHtml(c.command)} <span style="color:#565f89">— ${c.issuedBy}</span></div>
-                <span class="cmd-status ${c.status}">${c.status.toUpperCase()}</span>
-            </div>
-        `).join('')}
+    <div class="panel-header" style="margin-top:16px"><div class="panel-title">QUICK_ACTIONS</div></div>
+    <div class="quick-actions">
+        <button class="q-btn" onclick="broadcast('Sunucu bakıma alınıyor...', 'warning')">🔧 BAKIM</button>
+        <button class="q-btn danger" onclick="broadcast('ACİL DURUM!', 'error')">🚨 ACİL</button>
+        <button class="q-btn warning" onclick="clearLogs()">🗑️ TEMİZLE</button>
+        <button class="q-btn" onclick="sendCommand('restart')">🔄 YENİLE</button>
     </div>
 </div>
 
@@ -477,7 +753,7 @@ body{background:#020204;color:#a9b1d6;font-family:'Inter',system-ui,sans-serif;h
     <div class="panel-header">
         <div class="panel-title">LIVE_CONSOLE</div>
         <div style="display:flex;gap:8px">
-            <button onclick="clearLogs()" style="background:#f7768e22;border:1px solid #f7768e;color:#f7768e;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600">CLEAR</button>
+            <button onclick="clearLogs()" style="background:#f7768e22;border:1px solid #f7768e;color:#f7768e;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600">TEMİZLE</button>
             <button onclick="toggleAutoScroll()" id="autoscroll-btn" style="background:#9ece6a22;border:1px solid #9ece6a;color:#9ece6a;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600">AUTO: ON</button>
         </div>
     </div>
@@ -491,12 +767,12 @@ body{background:#020204;color:#a9b1d6;font-family:'Inter',system-ui,sans-serif;h
         `).join('')}
     </div>
     <div class="console-input-area">
-        <input type="text" class="console-input" id="cmd-input" placeholder="Komut girin... (örn: /kick username, /announce mesaj)" autocomplete="off">
-        <button class="send-btn" onclick="sendCommandFromInput()">EXECUTE</button>
+            <input type="text" class="console-input" id="console-cmd" placeholder="Komut girin... (örn: /kick username, /announce mesaj, /status)" autocomplete="off" onkeypress="if(event.key==='Enter')sendConsoleCommand()">
+        <button class="send-btn" onclick="sendConsoleCommand()">▶</button>
     </div>
 </div>
 
-<!-- RIGHT: NOTES & CHAT -->
+<!-- RIGHT: NOTES & CHAT & HIGH COMMAND -->
 <div style="display:flex;flex-direction:column;gap:12px;overflow:hidden">
     <div class="panel" style="flex:1.2">
         <div class="panel-header"><div class="panel-title">AGENT_NOTES</div></div>
@@ -532,236 +808,83 @@ body{background:#020204;color:#a9b1d6;font-family:'Inter',system-ui,sans-serif;h
             <input type="text" class="chat-input" id="chat-input" placeholder="Mesaj yaz..." autocomplete="off">
         </form>
     </div>
+    
+    <!-- YÜKSEK YETKİLİ KOMUT ALANI -->
+    <div class="high-cmd-area">
+        <div class="high-cmd-title">⚡ YÜKSEK YETKİLİ KOMUT</div>
+        <div style="font-size:11px;color:#565f89;margin-bottom:10px">Tehlikeli komutlar için şifre gerekli</div>
+        <input type="text" class="high-cmd-input" id="high-cmd-input" placeholder="Komut: /kick, /ban, /shutdown, /restart, /maintenance on/off, /clearblacklist" autocomplete="off" onkeypress="if(event.key==='Enter')sendHighCommand()">
+        <input type="password" class="high-cmd-pass" id="high-cmd-pass" placeholder="Yüksek yetkili şifresi..." autocomplete="off">
+        <button class="high-cmd-btn" onclick="sendHighCommand()">⚡ KOMUTU ÇALIŞTIR</button>
+        <div id="high-cmd-result" style="margin-top:10px;font-size:12px;font-family:monospace"></div>
+    </div>
 </div>
 
+</div>
+
+<!-- SETTINGS MODAL -->
+<div class="modal-overlay" id="settings-modal" onclick="if(event.target===this)closeSettings()">
+    <div class="modal">
+        <div class="modal-header">
+            <div class="modal-title">⚙️ TERMINAL AYARLARI</div>
+            <button class="modal-close" onclick="closeSettings()">✕</button>
+        </div>
+        
+        <div class="setting-item">
+            <label class="setting-label">Otomatik Yenileme</label>
+            <div class="setting-desc">Sayfayı otomatik olarak yeniler</div>
+            <div class="toggle-switch ${settingsMap.autoRefresh ? 'active' : ''}" onclick="toggleSetting(this, 'autoRefresh')" data-key="autoRefresh"></div>
+        </div>
+        
+        <div class="setting-item">
+            <label class="setting-label">Bildirim Sesleri</label>
+            <div class="setting-desc">Yeni olaylarda ses çalar</div>
+            <div class="toggle-switch ${settingsMap.soundEnabled ? 'active' : ''}" onclick="toggleSetting(this, 'soundEnabled')" data-key="soundEnabled"></div>
+        </div>
+        
+        <div class="setting-item">
+            <label class="setting-label">Komut Onay Sistemi</label>
+            <div class="setting-desc">Dışarıdan gelen komutlar için onay iste</div>
+            <div class="toggle-switch ${settingsMap.commandApprovalRequired ? 'active' : ''}" onclick="toggleSetting(this, 'commandApprovalRequired')" data-key="commandApprovalRequired"></div>
+        </div>
+        
+        <div class="setting-item">
+            <label class="setting-label">Bakım Modu</label>
+            <div class="setting-desc">Sunucuyu bakım moduna alır</div>
+            <div class="toggle-switch ${settingsMap.maintenanceMode ? 'active' : ''}" onclick="toggleSetting(this, 'maintenanceMode')" data-key="maintenanceMode"></div>
+        </div>
+        
+        <div class="setting-item">
+            <label class="setting-label">Yenileme Aralığı (saniye)</label>
+            <div class="setting-desc">Otomatik yenileme süresi</div>
+            <input type="number" class="setting-input" value="${settingsMap.refreshInterval || 10}" onchange="updateSetting('refreshInterval', this.value)" min="5" max="60">
+        </div>
+        
+        <div class="setting-item">
+            <label class="setting-label">Maksimum Satır</label>
+            <div class="setting-desc">Konsolda tutulacak maksimum log sayısı</div>
+            <input type="number" class="setting-input" value="${settingsMap.consoleMaxLines || 500}" onchange="updateSetting('consoleMaxLines', this.value)" min="100" max="2000">
+        </div>
+        
+        <div class="panel-header" style="margin-top:24px"><div class="panel-title">KARA LİSTE</div></div>
+        <div id="blacklist-container" style="margin-top:12px">
+            ${blacklistEntries.length === 0 ? '<div style="color:#565f89;font-size:12px;text-align:center;padding:20px">Kara liste boş</div>' : blacklistEntries.map(b => `
+                <div class="blacklist-item" data-blacklist-id="${b._id}">
+                    <div>
+                        <div class="blacklist-ip">${escapeHtml(b.ip)}</div>
+                        <div class="blacklist-reason">${escapeHtml(b.reason)} • ${new Date(b.timestamp).toLocaleDateString('tr-TR')}</div>
+                    </div>
+                    <button class="blacklist-remove" onclick="removeBlacklist('${b._id}')">KALDIR</button>
+                </div>
+            `).join('')}
+        </div>
+    </div>
 </div>
 
 <!-- TOAST CONTAINER -->
 <div class="toast-container" id="toast-container"></div>
 
-<script>
-const socket = io();
-const currentUser = "${escapeHtml(user)}";
-let autoScroll = true;
-
-// ═══════════════════════════════════════════════════════════════
-// BAĞLANTI & KİMLİK
-// ═══════════════════════════════════════════════════════════════
-socket.emit('agent-login', currentUser);
-socket.emit('agent-status', 'online');
-
-// Ping ölçümü
-setInterval(() => {
-    const start = Date.now();
-    socket.emit('ping-check');
-    socket.once('pong-check', () => {
-        document.getElementById('ping-badge').textContent = (Date.now() - start) + 'ms';
-    });
-}, 5000);
-
-// ═══════════════════════════════════════════════════════════════
-// SİSTEM METRİKLERİ
-// ═══════════════════════════════════════════════════════════════
-socket.on('system-metrics', (data) => {
-    document.getElementById('cpu-metric').textContent = data.cpu + '%';
-    document.getElementById('cpu-metric').className = 'metric-value' + (data.cpu > 80 ? ' danger' : data.cpu > 50 ? ' warning' : '');
-    document.getElementById('mem-metric').textContent = data.memory + 'MB';
-    document.getElementById('conn-metric').textContent = data.connections;
-    const hours = Math.floor(data.uptime / 3600);
-    const mins = Math.floor((data.uptime % 3600) / 60);
-    document.getElementById('uptime-metric').textContent = hours + 'h ' + mins + 'm';
-});
-
-// ═══════════════════════════════════════════════════════════════
-// AJAN LİSTESİ
-// ═══════════════════════════════════════════════════════════════
-socket.on('agents-update', (agents) => {
-    const list = document.getElementById('agent-list');
-    list.innerHTML = agents.map(a => \`
-        <div class="agent-item">
-            <div class="agent-dot \${a.status === 'away' ? 'away' : ''}"></div>
-            <div>
-                <div class="agent-name">\${a.username}</div>
-                <div class="agent-status">\${a.status === 'away' ? 'Away' : 'Online'} • \${new Date(a.since).toLocaleTimeString('tr-TR',{hour:'2-digit',minute:'2-digit'})}</div>
-            </div>
-        </div>
-    \`).join('');
-});
-
-// ═══════════════════════════════════════════════════════════════
-// KONSOL — GERÇEK ZAMANLI
-// ═══════════════════════════════════════════════════════════════
-const consoleBox = document.getElementById('console');
-
-socket.on('new-log', (log) => {
-    const entry = document.createElement('div');
-    entry.className = 'log-entry log-type-' + (log.type || 'info');
-    entry.innerHTML = \`
-        <span class="log-time">\${new Date(log.timestamp).toLocaleTimeString('tr-TR',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}</span>
-        <span class="log-user">\${escapeHtml(log.user || 'SYSTEM')}</span>
-        <span class="log-content">\${escapeHtml(log.content)}</span>
-    \`;
-    consoleBox.appendChild(entry);
-    if (autoScroll) consoleBox.scrollTop = consoleBox.scrollHeight;
-    showToast('Yeni log: ' + log.user, 'info');
-});
-
-socket.on('clear-logs', () => {
-    consoleBox.innerHTML = '<div style="color:#565f89;text-align:center;padding:40px;font-size:14px">🗑️ Konsol temizlendi</div>';
-    showToast('Konsol temizlendi', 'success');
-});
-
-function toggleAutoScroll() {
-    autoScroll = !autoScroll;
-    document.getElementById('autoscroll-btn').textContent = 'AUTO: ' + (autoScroll ? 'ON' : 'OFF');
-    document.getElementById('autoscroll-btn').style.borderColor = autoScroll ? '#9ece6a' : '#565f89';
-    document.getElementById('autoscroll-btn').style.color = autoScroll ? '#9ece6a' : '#565f89';
-}
-
-// ═══════════════════════════════════════════════════════════════
-// NOTLAR — GERÇEK ZAMANLI
-// ═══════════════════════════════════════════════════════════════
-const notesContainer = document.getElementById('notes-container');
-
-socket.on('new-note', (note) => {
-    const colors = ['#7aa2f7', '#bb9af7', '#9ece6a', '#f7768e', '#e0af68', '#ff9e64'];
-    const div = document.createElement('div');
-    div.className = 'note-item';
-    div.style.borderLeftColor = note.color;
-    div.setAttribute('data-note-id', note._id);
-    div.innerHTML = \`
-        <button class="note-delete" onclick="deleteNote('\${note._id}')">✕</button>
-        <div class="note-header">
-            <span class="note-author">\${escapeHtml(note.author)}</span>
-            <span class="note-time">\${new Date(note.timestamp).toLocaleTimeString('tr-TR',{hour:'2-digit',minute:'2-digit'})}</span>
-        </div>
-        <div class="note-text">\${escapeHtml(note.content)}</div>
-    \`;
-    notesContainer.insertBefore(div, notesContainer.firstChild);
-    showToast(note.author + ' yeni not ekledi', 'success');
-});
-
-socket.on('delete-note', (id) => {
-    const el = document.querySelector('[data-note-id="' + id + '"]');
-    if (el) el.remove();
-});
-
-async function addNote(e) {
-    e.preventDefault();
-    const input = document.getElementById('note-input');
-    if (!input.value.trim()) return;
-    await fetch('/api/note', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({note: input.value}) });
-    input.value = '';
-}
-
-async function deleteNote(id) {
-    if (!confirm('Not silinsin mi?')) return;
-    await fetch('/api/note/' + id, { method: 'DELETE' });
-}
-
-// ═══════════════════════════════════════════════════════════════
-// CHAT — GERÇEK ZAMANLI
-// ═══════════════════════════════════════════════════════════════
-const chatBox = document.getElementById('chat-box');
-
-socket.on('chat-message', (data) => {
-    const div = document.createElement('div');
-    div.className = 'chat-msg ' + (data.author === currentUser ? 'own' : '');
-    div.innerHTML = \`
-        <div class="chat-author">\${escapeHtml(data.author)}</div>
-        <div class="chat-text">\${escapeHtml(data.message)}</div>
-        <div class="chat-time">\${new Date(data.timestamp).toLocaleTimeString('tr-TR',{hour:'2-digit',minute:'2-digit'})}</div>
-    \`;
-    chatBox.appendChild(div);
-    chatBox.scrollTop = chatBox.scrollHeight;
-    if (data.author !== currentUser) showToast(data.author + ': ' + data.message, 'info');
-});
-
-function sendChat(e) {
-    e.preventDefault();
-    const input = document.getElementById('chat-input');
-    if (!input.value.trim()) return;
-    socket.emit('chat-message', { author: currentUser, message: input.value });
-    input.value = '';
-}
-
-// ═══════════════════════════════════════════════════════════════
-// KOMUTLAR
-// ═══════════════════════════════════════════════════════════════
-socket.on('new-command', (cmd) => {
-    const list = document.getElementById('command-list');
-    const div = document.createElement('div');
-    div.className = 'cmd-item';
-    div.setAttribute('data-cmd-id', cmd._id);
-    div.innerHTML = \`
-        <div><span style="color:#7aa2f7">$</span> \${escapeHtml(cmd.command)} <span style="color:#565f89">— \${cmd.issuedBy}</span></div>
-        <span class="cmd-status pending">PENDING</span>
-    \`;
-    list.insertBefore(div, list.firstChild);
-    showToast('Yeni komut: ' + cmd.command, 'warning');
-});
-
-socket.on('update-command', (data) => {
-    const el = document.querySelector('[data-cmd-id="' + data.id + '"] .cmd-status');
-    if (el) {
-        el.className = 'cmd-status ' + data.status;
-        el.textContent = data.status.toUpperCase();
-    }
-});
-
-function sendCommand(cmd) {
-    fetch('/api/command', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({command: cmd}) });
-}
-
-function sendCommandFromInput() {
-    const input = document.getElementById('cmd-input');
-    if (!input.value.trim()) return;
-    sendCommand(input.value);
-    input.value = '';
-}
-
-// ═══════════════════════════════════════════════════════════════
-// BİLDİRİMLER (TOAST)
-// ═══════════════════════════════════════════════════════════════
-function showToast(message, type = 'info') {
-    const container = document.getElementById('toast-container');
-    const toast = document.createElement('div');
-    toast.className = 'toast ' + type;
-    toast.innerHTML = '<div class="toast-text">' + message + '</div>';
-    container.appendChild(toast);
-    setTimeout(() => { toast.style.opacity = '0'; toast.style.transform = 'translateX(100%)'; setTimeout(() => toast.remove(), 400); }, 4000);
-}
-
-socket.on('notification', (data) => showToast(data.message, data.type));
-
-async function broadcast(msg, type) {
-    await fetch('/api/broadcast', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({message: msg, type}) });
-}
-
-async function clearLogs() {
-    if (!confirm('Tüm logları temizle?')) return;
-    await fetch('/api/clear-logs', { method: 'POST' });
-}
-
-// ═══════════════════════════════════════════════════════════════
-// YARDIMCI
-// ═══════════════════════════════════════════════════════════════
-function escapeHtml(text) {
-    if (typeof text !== 'string') return text;
-    return text.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");
-}
-
-// Başlangıç scroll
-consoleBox.scrollTop = consoleBox.scrollHeight;
-chatBox.scrollTop = chatBox.scrollHeight;
-
-// Input focus'ta auto-scroll durdurma
-document.querySelectorAll('input').forEach(inp => {
-    inp.addEventListener('focus', () => { autoScroll = false; toggleAutoScroll(); });
-    inp.addEventListener('blur', () => { autoScroll = true; toggleAutoScroll(); });
-});
-</script>
-
+<script src="/terminal.js"></script>
 </body>
 </html>`;
 }
@@ -778,6 +901,7 @@ server.listen(PORT, () => {
     ║           Real-time Roblox Command Center                    ║
     ║           Port: ${PORT}                                       
     ║           Mode: PRODUCTION READY                             ║
+    ║           High Command Key: ${HIGH_COMMAND_KEY.substring(0,10)}...          ║
     ║                                                              ║
     ╚══════════════════════════════════════════════════════════════╝
     `);
