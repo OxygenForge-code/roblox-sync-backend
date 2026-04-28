@@ -52,7 +52,6 @@ socket.on('system-metrics', (data) => {
     if (uptimeEl) {
         const hours = Math.floor(data.uptime / 3600);
         const mins = Math.floor((data.uptime % 3600) / 60);
-        const secs = Math.floor(data.uptime % 60);
         uptimeEl.textContent = hours + 'h ' + mins + 'm';
     }
 });
@@ -79,6 +78,40 @@ socket.on('agents-update', (agents) => {
         </div>
     `).join('');
 });
+
+// ═══════════════════════════════════════════════════════════════
+// İZİN SİSTEMİ — CONSOLE PERMISSION
+// ═══════════════════════════════════════════════════════════════
+socket.on('console-permission-request', (data) => {
+    const queue = document.getElementById('perm-queue');
+    if (!queue) return;
+    
+    // "Bekleyen izin isteği yok" mesajını kaldır
+    const emptyMsg = queue.querySelector('[style*="Bekleyen izin isteği yok"]');
+    if (emptyMsg) emptyMsg.remove();
+    
+    const div = document.createElement('div');
+    div.className = 'perm-request';
+    div.setAttribute('data-request-id', data.requestId);
+    div.innerHTML = `
+        <div class="perm-title">⚠️ İZİN İSTEĞİ</div>
+        <div class="perm-cmd">${escapeHtml(data.command)}</div>
+        <div style="font-size:11px;color:#565f89;margin-bottom:10px">Kaynak: ${escapeHtml(data.source)} • ${new Date(data.timestamp).toLocaleTimeString('tr-TR')}</div>
+        <div class="perm-buttons">
+            <button class="perm-btn approve" onclick="approveCommand('${data.requestId}', true)">✅ ONAYLA</button>
+            <button class="perm-btn deny" onclick="approveCommand('${data.requestId}', false)">❌ REDDET</button>
+        </div>
+    `;
+    queue.appendChild(div);
+    
+    showToast('⚠️ Yeni izin isteği!', 'warning');
+});
+
+function approveCommand(requestId, approved) {
+    socket.emit('approve-console-command', { requestId, approved });
+    const el = document.querySelector('[data-request-id="' + requestId + '"]');
+    if (el) el.remove();
+}
 
 // ═══════════════════════════════════════════════════════════════
 // KONSOL — GERÇEK ZAMANLI
@@ -114,9 +147,6 @@ function addLogToConsole(log) {
 
 socket.on('new-log', (log) => {
     addLogToConsole(log);
-    if (log.user !== currentUser) {
-        showToast('📥 Yeni log: ' + escapeHtml(log.user || 'SYSTEM'), 'info');
-    }
 });
 
 socket.on('clear-logs', () => {
@@ -125,6 +155,46 @@ socket.on('clear-logs', () => {
     }
     showToast('Konsol temizlendi', 'success');
 });
+
+function sendConsoleCommand() {
+    const input = document.getElementById('console-cmd');
+    if (!input || !input.value.trim()) return;
+    
+    const cmd = input.value.trim();
+    
+    // Normal komutları direkt işle
+    if (cmd.startsWith('/announce ')) {
+        const msg = cmd.substring(10);
+        socket.emit('chat-message', { author: 'SYSTEM', message: '[DUYURU] ' + msg });
+        showToast('Duyuru yayınlandı', 'success');
+    } else if (cmd === '/status') {
+        addLogToConsole({ 
+            type: 'system', 
+            user: 'SYSTEM', 
+            content: 'Sistem durumu: NORMAL | Bağlı ajan: ' + document.querySelectorAll('.agent-item').length, 
+            timestamp: new Date() 
+        });
+    } else if (cmd === '/help') {
+        addLogToConsole({ 
+            type: 'system', 
+            user: 'SYSTEM', 
+            content: 'Komutlar: /announce, /status, /help, /clear | Yüksek yetkili: /kick, /ban, /shutdown, /restart', 
+            timestamp: new Date() 
+        });
+    } else if (cmd === '/clear') {
+        clearLogs();
+    } else {
+        // Bilinmeyen komut - log olarak kaydet
+        addLogToConsole({ 
+            type: 'warning', 
+            user: currentUser, 
+            content: 'Komut çalıştırıldı: ' + cmd, 
+            timestamp: new Date() 
+        });
+    }
+    
+    input.value = '';
+}
 
 function toggleAutoScroll() {
     autoScroll = !autoScroll;
@@ -135,6 +205,48 @@ function toggleAutoScroll() {
         btn.style.color = autoScroll ? '#9ece6a' : '#565f89';
     }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// YÜKSEK YETKİLİ KOMUTLAR
+// ═══════════════════════════════════════════════════════════════
+function sendHighCommand() {
+    const cmdInput = document.getElementById('high-cmd-input');
+    const passInput = document.getElementById('high-cmd-pass');
+    const resultDiv = document.getElementById('high-cmd-result');
+    
+    if (!cmdInput || !passInput) return;
+    
+    const command = cmdInput.value.trim();
+    const password = passInput.value;
+    
+    if (!command) {
+        if (resultDiv) resultDiv.innerHTML = '<span style="color:#f7768e">❌ Komut girin!</span>';
+        return;
+    }
+    if (!password) {
+        if (resultDiv) resultDiv.innerHTML = '<span style="color:#f7768e">❌ Şifre gerekli!</span>';
+        return;
+    }
+    
+    socket.emit('high-command', { command, password });
+    
+    if (resultDiv) resultDiv.innerHTML = '<span style="color:#e0af68">⏳ İşleniyor...</span>';
+}
+
+socket.on('high-command-result', (data) => {
+    const resultDiv = document.getElementById('high-cmd-result');
+    if (!resultDiv) return;
+    
+    if (data.success) {
+        resultDiv.innerHTML = '<span style="color:#9ece6a">✅ ' + escapeHtml(data.result) + '</span>';
+        document.getElementById('high-cmd-input').value = '';
+        document.getElementById('high-cmd-pass').value = '';
+    } else {
+        resultDiv.innerHTML = '<span style="color:#f7768e">❌ ' + escapeHtml(data.error) + '</span>';
+    }
+    
+    setTimeout(() => { resultDiv.innerHTML = ''; }, 5000);
+});
 
 // ═══════════════════════════════════════════════════════════════
 // NOTLAR — GERÇEK ZAMANLI
@@ -239,7 +351,7 @@ socket.on('chat-message', (data) => {
     chatBox.scrollTop = chatBox.scrollHeight;
     
     if (data.author !== currentUser) {
-        showToast('💬 ' + escapeHtml(data.author) + ': ' + escapeHtml(data.message), 'info');
+        showToast('💬 ' + escapeHtml(data.author) + ': ' + escapeHtml(data.message.substring(0, 30)) + (data.message.length > 30 ? '...' : ''), 'info');
     }
 });
 
@@ -256,55 +368,53 @@ function sendChat(e) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// KOMUTLAR
+// AYARLAR MODAL
 // ═══════════════════════════════════════════════════════════════
-socket.on('new-command', (cmd) => {
-    const list = document.getElementById('command-list');
-    if (!list) return;
-    
-    // "Komut kuyruğu boş" mesajını kaldır
-    const emptyMsg = list.querySelector('[style*="Komut kuyruğu boş"]');
-    if (emptyMsg) emptyMsg.remove();
-    
-    const div = document.createElement('div');
-    div.className = 'cmd-item';
-    div.setAttribute('data-cmd-id', cmd._id || cmd.id);
-    div.style.animation = 'fadeIn 0.3s ease';
-    div.innerHTML = `
-        <div><span style="color:#7aa2f7">$</span> ${escapeHtml(cmd.command)} <span style="color:#565f89">— ${escapeHtml(cmd.issuedBy)}</span></div>
-        <span class="cmd-status pending">PENDING</span>
-    `;
-    list.insertBefore(div, list.firstChild);
-    
-    showToast('⚡ Yeni komut: ' + escapeHtml(cmd.command), 'warning');
-});
+function openSettings() {
+    document.getElementById('settings-modal').classList.add('active');
+}
 
-socket.on('update-command', (data) => {
-    const el = document.querySelector('[data-cmd-id="' + data.id + '"] .cmd-status');
-    if (el) {
-        el.className = 'cmd-status ' + data.status;
-        el.textContent = data.status.toUpperCase();
-    }
-});
+function closeSettings() {
+    document.getElementById('settings-modal').classList.remove('active');
+}
 
-async function sendCommand(cmd) {
+function toggleSetting(el, key) {
+    const isActive = el.classList.contains('active');
+    el.classList.toggle('active');
+    updateSetting(key, !isActive);
+}
+
+async function updateSetting(key, value) {
     try {
-        const res = await fetch('/api/command', {
+        const res = await fetch('/api/settings', {
             method: 'POST',
             headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({command: cmd})
+            body: JSON.stringify({key, value})
         });
-        if (!res.ok) showToast('❌ Komut gönderilemedi', 'error');
+        if (res.ok) {
+            showToast('✅ Ayar kaydedildi', 'success');
+        } else {
+            showToast('❌ Ayar kaydedilemedi', 'error');
+        }
     } catch(err) {
         showToast('❌ Bağlantı hatası', 'error');
     }
 }
 
-function sendCommandFromInput() {
-    const input = document.getElementById('cmd-input');
-    if (!input || !input.value.trim()) return;
-    sendCommand(input.value.trim());
-    input.value = '';
+async function removeBlacklist(id) {
+    if (!confirm('Kara listeden kaldır?')) return;
+    try {
+        const res = await fetch('/api/blacklist/' + id, { method: 'DELETE' });
+        if (res.ok) {
+            const el = document.querySelector('[data-blacklist-id="' + id + '"]');
+            if (el) el.remove();
+            showToast('✅ Kara listeden kaldırıldı', 'success');
+        } else {
+            showToast('❌ İşlem başarısız', 'error');
+        }
+    } catch(err) {
+        showToast('❌ Bağlantı hatası', 'error');
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -317,7 +427,7 @@ function showToast(message, type = 'info') {
     const toast = document.createElement('div');
     toast.className = 'toast ' + type;
     toast.style.animation = 'toastIn 0.4s ease';
-    toast.innerHTML = `<div class="toast-text">${message}</div>`;
+    toast.innerHTML = '<div class="toast-text">' + message + '</div>';
     container.appendChild(toast);
     
     // Max 5 toast tut
@@ -362,6 +472,19 @@ async function clearLogs() {
     }
 }
 
+async function sendCommand(cmd) {
+    try {
+        const res = await fetch('/api/command', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({command: cmd})
+        });
+        if (!res.ok) showToast('❌ Komut gönderilemedi', 'error');
+    } catch(err) {
+        showToast('❌ Bağlantı hatası', 'error');
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // YARDIMCI FONKSİYONLAR
 // ═══════════════════════════════════════════════════════════════
@@ -388,14 +511,6 @@ document.addEventListener('DOMContentLoaded', () => {
         inp.addEventListener('focus', () => { isInputFocused = true; });
         inp.addEventListener('blur', () => { isInputFocused = false; });
     });
-    
-    // Enter tuşu desteği
-    const cmdInput = document.getElementById('cmd-input');
-    if (cmdInput) {
-        cmdInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') sendCommandFromInput();
-        });
-    }
     
     // Başlangıç bildirimi
     setTimeout(() => {
